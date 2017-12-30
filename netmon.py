@@ -2,11 +2,11 @@
 #Made to run on Windows at command prompt
 #the main function runs it all and calls the other functions
 
-
 from netmiko import ConnectHandler
 from netmiko.ssh_exception import NetMikoTimeoutException
 from netmiko.ssh_exception import NetMikoAuthenticationException
-import pandas as pd
+import time
+import datetime
 import getpass
 import os
 
@@ -17,103 +17,105 @@ _username = raw_input('Enter your username: ')
 password = getpass.getpass('Password: ')
 #_username = ''
 #password = ''
-
-mac_list=[]
-
+hosts_checked = []
+current_mac_list=[]
 
 #Define functions below
 
 def main():
     for i in hosts:
         net_connect = connect_to_host(i) #connect to host
+        print('connected')
         #get hostname
         hostname = getHostname(net_connect)
+        #be sure we havent previously checked this hostname
+        if hostname in hosts_checked:
+            print('Duplicate host entry')
+            continue
         print(hostname)
         #open a file to write mac addresses to ;this should be a database later
         int_list = get_interfaces(net_connect) #get the list of interfaces, read into list
+        print('got int list')
         #feed the list of interfaces into another loop that gets the mac address of each & &
-        for x in int_list:
-            _a = get_mac(net_connect, x)
-            _a.insert(0,x)
-            mac_list.append(_a)
-        #write the macs to a temp file, ex: hostname_temp.csv
-        write_file(mac_list, hostname)
-        #compare the contents of the temp file to the previous version of the mac_address file
-        check_macs(hostname)
-        #alert on any changes to the mac file
-        #rename the old mac file and make this mac address file the new one to be compared to next time
+        current_mac_list = get_macs(net_connect, int_list)
+        print('got macs')
+        #compare the macs to see if any have never been seen before
+        new_macs = check_macs(current_mac_list, hostname, net_connect)
+        #add hostname to list of files checked
+        hosts_checked.append(hostname)
         #print(mac_list)
         print(str(i) + ' done')
 
-def check_macs(name):
-    f_temp = name + '_temp.csv'
-    f_name_old = name + '.csv'
-    with open(f_name_old, 'rb') as csvfile1:
-        with open (f_temp, "rb") as csvfile2:
-            #open the csv files and read them into lists
-            reader1 = csv.reader(csvfile1)
-            content1 = list(reader1)
-            reader2 = csv.reader(csvfile2)
-            content2 = list(reader2)
-            #run a loop and compare the two lists
-            file_length = len(content1)
-            ctr = 0
-            while ctr < file_length:
-                #read the values in the content files
-                _a = content1[ctr]
-                _b = content2[ctr]
-                #loop through the files and compare the lists
-                max = len(_a)
-                _ctr1 = 0
-                while _ctr1 < max:
-                    #make sure that the two values are not null(ie nothing in the ports on both)
-                    if _a[_ctr1] != '' or _b[_ctr1] != '':
-                        if _a[_ctr1] != _b[_ctr1]:
-                            write_results(_a, _b, name)
-                    _ctr1 += 1
-                ctr+=1
+
+def check_macs(mac_list, host, connect):
+    file_name = 'data_files/' + host + '.dat'
+    if os.path.isfile(file_name):
+        #the file exists so
+        with open(file_name, 'a+') as mac_file:
+            old_macs_list = mac_file.read().splitlines()
+        for mac in mac_list:
+            if mac not in old_macs_list:
+                write_results(mac, host, connect)
+                old_macs_list.append(mac)
+                #mac_file.write(mac)
+        with open(file_name, 'w+') as out_file:
+            for m in old_macs_list:
+                out_file.write(m + '\n')
+    else:
+        print('File not present for {}, probably a new device' .format(host))
+        write_file(mac_list, host)
+
+def get_port(mac, host, connect):
+    c_command = 'show mac address-table address ' + mac
+    raw_output = connect.send_command(c_command)
+    return raw_output
+
 
 def getHostname(net_connect):
     host = net_connect.find_prompt()
     return host.replace("#",'')
 
 def write_file(list, name):
-    file_name = name + '_temp.csv'
-    my_df = pd.DataFrame(list)
-    my_df.to_csv(file_name, index=False, header=False)
+    #os.chdir('data_files')
+    file_name = 'data_files/' + name + '.dat'
+    with open(file_name, 'a') as out_file:
+        for i  in list:
+            out_file.write(i + '\n')
 
-
-def write_results(a, b, name):
+def write_results(mac, name, connect):
     with open('scan_results.txt', 'a')as out_file:
-        out_file.write('Scan results for ' + name + '\n')
-        out_file.write(str(a)+ '\n')
-        out_file.write(str(b)+ '\n')
+        d = time.strftime("%Y-%m-%d %H:%M")
+        out_file.write('Scan results for ' + name +  ' at ' +  str(d) + '\n')
+        out_file.write('This mac has not been seen before:   ' + str(mac)+ '\n')
+        command_output = get_port(mac, name, connect)
+        out_file.write(command_output + '\n')
+        out_file.write('MAC added to the list so this message will not show again' + '\n')
         out_file.write('*'*100 + '\n')
 
 
-def get_mac(connect, interface_name):
-    c_command = 'sh mac address-table ' + str(interface_name) + ' | include dynamic'
-    raw_output = connect.send_command(c_command)
-    #extract the macs
-    output_lines = raw_output.split('\n')
+def get_macs(connect, int_list):
     out_list = []
-    for x in output_lines:
-        line_split = x.split()
-        if len(line_split) == 5:
-            vlan, mac_addr, type, protocols, port = line_split
-            out_list.append(mac_addr)
-        elif len(line_split) == 4:
-            vlan, mac_addr, type, port = line_split
-            out_list.append(mac_addr)
+    for interface in int_list:
+        c_command = 'sh mac address-table ' + str(interface) + ' | include dynamic'
+        raw_output = connect.send_command(c_command)
+        #extract the macs
+        output_lines = raw_output.split('\n')
+        for x in output_lines:
+            line_split = x.split()
+            if len(line_split) == 5:
+                vlan, mac_addr, type, protocols, port = line_split
+                out_list.append(mac_addr)
+            elif len(line_split) == 4:
+                vlan, mac_addr, type, port = line_split
+                out_list.append(mac_addr)
     return out_list
-
 
 def get_interfaces(net_connect):
     #get the interfaces
     output_gig = net_connect.send_command('sh run | inc interface Gigabit')
     output_fast = net_connect.send_command('sh run | inc interface Fast')
-    #output_tengig = net_connect.send_command('sh run | inc interface TenGigabit')
-    #put them in a usable list
+    #put all interfaces into a list
+        #put them in a usable list
     make_list_fast = make_list(output_fast)
     make_list_gig = make_list(output_gig)
     #combine them into a MEGALIST!
@@ -128,8 +130,8 @@ def connect_to_host(_ip):
     except(NetMikoAuthenticationException):
         print (' Cannot connect . . . bad username or password')
 
-
 def make_list(input):
+    #writing it to a file to remove the u\ that preceds the output - need to find a more effiecent way to do this
     f_out = open('ethernet.txt', 'w')
     f_out.write(input)
     f_out.close()
@@ -146,57 +148,3 @@ main()
 
 
 
-
-
-#########################OLD CODE######################################################
-
-##def get_interfaces(net_connect):
-##    print('getint ran')
-##    output = net_connect.send_command('sh run | inc interface Gigabit')
-##    output_two = net_connect.send_command('sh run | inc interface Fast')
-##    output_three = net_connect.send_command('sh run | inc interface TenGigabit')
-##    print (output)
-##    print (output_two)
-##    f_out = open('ethernet.txt', 'a')
-##    f_out.write(output)
-##    f_out.write('\n')
-##    f_out.write(output_two)
-##    f_out.close()
-##    #print('getint done')
-##    #pass
-##    net_connect.disconnect()
-
-    #run your commands
-##    print('*' * 100)
-##    print ('Connecting to. . . . ' + str(i))
-##    hostname = net_connect.find_prompt()
-##    hostname = hostname.replace("#",'')
-##    print('-' * 100)
-##    print (hostname)
-
-    
-    #output = net_connect.send_command('sh run | inc hostname')
-    #print (output)
-    #print (output_two)
-##    output = net_connect.send_command('sh mac address-table')
-##    #break the output into lines split on newline character
-##    output_lines = output.split('\n')
-##    output_list = []
-##    #iterate through and put into list
-##    for x in output_lines:
-##        line_split = x.split()
-##        if len(line_split) == 5:
-##            vlan, mac_addr, type, protocols, port = line_split
-##            output_list.append((port, mac_addr))
-##        elif len(line_split) == 4:
-##            vlan, mac_addr, type, port = line_split
-##            output_list.append((port, mac_addr))
-##    for i in output_list:
-##        print (i)
-##    #pprint.pprint(output_list)   
-    #print (output)
-    #print('*' * 100)
-    
-##        for i in int_list:
-##            print(i)
-#print('all done')
